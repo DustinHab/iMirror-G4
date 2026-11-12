@@ -26,6 +26,7 @@
 #include <time.h>
 #include "uyvy.h"
 #include "dekoder.h"
+#include "ton.h"
 
 #define VLC_PFAD "/Applications/PowerVLC.app/Contents/MacOS"
 #define LEISTE 26.0
@@ -690,6 +691,7 @@ static void *dekodierfaden(void *x)
             if (Mess_aktiv) mess_bild(&b, an, fertig, sender, 1);
             dek_fertig();
             zuletzt_gezeigt = hochzeit();
+            ton_bild(sender, zuletzt_gezeigt);
             St_gezeigt++;
             St_verzug_summe += verzug(sender, zuletzt_gezeigt);
             if (verzug(sender, zuletzt_gezeigt) > St_verzug_max) St_verzug_max = verzug(sender, zuletzt_gezeigt);
@@ -1809,6 +1811,16 @@ static NSString *uti_fuer(NSString *pfad)
         }
         r0 = St_rahmen; b0 = St_bilder; g0 = St_gezeigt; a0 = St_ausgelassen; f0 = St_fehler;
         St_dek_summe = St_dek_max = St_verzug_summe = St_verzug_max = 0;
+        {
+            /* Ton: in der ersten Minute alle 5 s, danach alle 30 s */
+            static int takt, zeilen;
+            char z[400];
+            if ((zeilen < 12 || ++takt >= 6) && ton_zeile(z, sizeof z)) {
+                fprintf(stderr, "Spiegel: %s\n", z);
+                zeilen++;
+                takt = 0;
+            }
+        }
         return;
     }
     m = mp ? libvlc_media_player_get_media(mp) : NULL;
@@ -1934,6 +1946,7 @@ static NSString *uti_fuer(NSString *pfad)
         if (Eigener_weg) {
             pthread_create(&z, &a, dekodierfaden, NULL);
             pthread_create(&z, &a, messfaden, NULL);
+            ton_start();
         }
     }
     if (Eigener_weg) goto weiter;

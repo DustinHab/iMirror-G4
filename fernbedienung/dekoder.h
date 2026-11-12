@@ -18,4 +18,15 @@ void dek_entlasten(int an);                   /* Glaettungsfilter fuer Nicht-Ref
 int dek_filter_aktiv(void);                   /* 1 = AltiVec-Glaettungsfilter eingesetzt */
 void *dek_symbol(const char *name);           /* Funktion im PowerVLC-Modul (fuer Tests) */
 
+/* Ton: AAC mit AudioSpecificConfig (AAC-ELD bei der Bildschirmsynchronisierung), Ausgabe Gleitkomma je Kanal */
+typedef struct {
+    const float *links, *rechts;
+    int anzahl, format;
+} Dek_ton;
+
+int dek_ton_an(const unsigned char *asc, int n, int rate, int kanaele, char *fehler, int nfehler);   /* nach dek_an */
+int dek_ton_schicken(unsigned char *p, int n);   /* p aus dek_puffer, wird uebernommen */
+int dek_ton_holen(Dek_ton *t);                  /* 1 Rahmen da, 0 keiner, < 0 Fehler */
+void dek_ton_fertig(void);
+
 #endif

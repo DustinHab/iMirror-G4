@@ -234,12 +234,14 @@ static const unsigned char *hole_daten(CFDictionaryRef d, const char *k, int *n)
 typedef struct Stueck { struct Stueck *nach; int n, pos; unsigned char d[1]; } Stueck;
 
 static struct {
-    unsigned char aeskey[16];
+    unsigned char aeskey[16], aesiv[16];
     int aeskey_da;
     /* NTP */
     int ntp_fd; CFSocketRef ntp_s; CFRunLoopTimerRef ntp_uhr; struct sockaddr_in ntp_ziel; int ntp_port;
-    /* Ton: nur annehmen */
+    double uhr_ab; int uhr_da;
+    /* Ton: Pakete gehen verschluesselt ueber eine zweite Pipe (fd 3) an die Anzeige, die dekodiert und spielt */
     int ton_fd[2]; CFSocketRef ton_s[2]; int ton_port[2];
+    int ton_pipe; char ton_format[96]; double ton_vol; int ton_vol_da; long ton_pakete, ton_verloren;
     /* Video */
     int dl_fd; CFSocketRef dl_s; int daten_port;
     int dv_fd; CFSocketRef dv_s; unsigned char *db; int dn, dcap;
@@ -249,7 +251,7 @@ static struct {
     /* Anzeige */
     pid_t anz_pid; int anz_fd; Stueck *kopf, *ende; long rueckstau; int bis_idr; CFRunLoopTimerRef anz_uhr;
     long bilder, verworfen;
-} S = { .ntp_fd = -1, .ton_fd = { -1, -1 }, .dl_fd = -1, .dv_fd = -1, .anz_fd = -1 };
+} S = { .ntp_fd = -1, .ton_fd = { -1, -1 }, .ton_pipe = -1, .dl_fd = -1, .dv_fd = -1, .anz_fd = -1 };
 
 static CFSocketRef quelle(int fd, CFSocketCallBack f, void *info)
 {
@@ -284,11 +286,77 @@ static int udp_offen(int *port)
     return fd;
 }
 
-static void ablassen(CFSocketRef s, CFSocketCallBackType t, CFDataRef a, const void *d, void *i)
+/* ---------- Ton an die Anzeige ----------
+   Satz: [2 Byte Laenge][1 Byte Art][Inhalt]; Arten: k Schluessel und IV (je 16), f Format (Text),
+   a RTP-Paket (verschluesselt, wie empfangen), s Synchronpaket des Steuerports, u Uhr (Text: Abstand ts0),
+   v Lautstaerke (Text, dB). Saetze bis 512 Byte schreibt eine Pipe am Stueck; ist sie voll, entfaellt der Satz. */
+static void ton_schicken(int art, const void *d, int n)
+{
+    unsigned char b[512];
+    if (S.ton_pipe < 0 || n < 0 || n + 3 > (int)sizeof b) return;
+    b[0] = (unsigned char)(n >> 8);
+    b[1] = (unsigned char)n;
+    b[2] = (unsigned char)art;
+    memcpy(b + 3, d, (size_t)n);
+    if (write(S.ton_pipe, b, (size_t)n + 3) != n + 3) S.ton_verloren++;
+}
+
+static void ton_text(int art, const char *t) { ton_schicken(art, t, (int)strlen(t)); }
+
+static void ton_uhr_schicken(void)
+{
+    char t[64];
+    if (!S.uhr_da) return;
+    snprintf(t, sizeof t, "%.9f %llu", S.uhr_ab, S.ts0_da ? S.ts0 : 0ULL);
+    ton_text('u', t);
+}
+
+/* alles, was die Anzeige zum Ton wissen muss (nach SETUP und wenn die Anzeige startet) */
+static void ton_infos_schicken(void)
+{
+    unsigned char k[32];
+    char t[32];
+    if (!S.aeskey_da || !S.ton_format[0]) return;
+    memcpy(k, S.aeskey, 16);        /* derselbe gehashte Schluessel wie fuers Bild, dazu eiv aus SETUP */
+    memcpy(k + 16, S.aesiv, 16);
+    ton_schicken('k', k, 32);
+    ton_text('f', S.ton_format);
+    ton_uhr_schicken();
+    if (S.ton_vol_da) { snprintf(t, sizeof t, "%.3f", S.ton_vol); ton_text('v', t); }
+}
+
+/* das iPhone schickt jedes Tonpaket dreimal (versetzt mit den Nachbarn): nur die erste Ankunft weitergeben */
+static int ton_neu(const unsigned char *p)
+{
+    static unsigned letzte[16];
+    static int pos;
+    unsigned ts = (unsigned)p[4] << 24 | (unsigned)p[5] << 16 | (unsigned)p[6] << 8 | p[7];
+    int k;
+    for (k = 0; k < 16; k++) if (letzte[k] == ts) return 0;
+    letzte[pos] = ts;
+    pos = (pos + 1) % 16;
+    return 1;
+}
+
+static void ton_daten(CFSocketRef s, CFSocketCallBackType t, CFDataRef a, const void *d, void *i)
 {
     unsigned char b[2048];
+    ssize_t r = recv(CFSocketGetNative(s), b, sizeof b, 0);
     (void)t; (void)a; (void)d; (void)i;
-    recv(CFSocketGetNative(s), b, sizeof b, 0);
+    if (r < 12 || !ton_neu(b)) return;
+    S.ton_pakete++;
+    ton_schicken('a', b, (int)r);
+}
+
+/* Steuerport: 0x54 Synchronpaket (RTP-Zeit, NTP-Zeit), 0x56 nachgereichtes Paket ab Byte 4 */
+static void ton_steuer(CFSocketRef s, CFSocketCallBackType t, CFDataRef a, const void *d, void *i)
+{
+    unsigned char b[2048];
+    ssize_t r = recv(CFSocketGetNative(s), b, sizeof b, 0);
+    (void)t; (void)a; (void)d; (void)i;
+    if (r < 4) return;
+    if ((b[1] & 0x7f) == 0x54 && r >= 20) ton_schicken('s', b, (int)r);
+    else if ((b[1] & 0x7f) == 0x56 && r >= 16 && ton_neu(b + 4)) ton_schicken('a', b + 4, (int)r - 4);
 }
 
 /* NTP-Antwort des iPhones (80 d3 00 07, 0000, Ursprung, Empfang, Senden): Uhrabstand (Uhr des iPhones minus eigene,
@@ -301,10 +369,13 @@ static double ntp_sek(const unsigned char *p)
     return (double)s + (double)f / 4294967296.0;
 }
 
+static double Ntp_abst[30], Ntp_lauf[30];
+static int Ntp_n, Ntp_pos;
+
 static void ntp_antwort(CFSocketRef s, CFSocketCallBackType t, CFDataRef a, const void *d, void *i)
 {
-    static double abst[30], lauf[30];
-    static int n, pos, gemeldet;
+    double *abst = Ntp_abst, *lauf = Ntp_lauf;
+    static int gemeldet;
     unsigned char b[256];
     union { struct cmsghdr h; char b[64]; } k;
     struct iovec io;
@@ -333,12 +404,15 @@ static void ntp_antwort(CFSocketRef s, CFSocketCallBackType t, CFDataRef a, cons
     t2 = ntp_sek(b + 16);
     t3 = ntp_sek(b + 24);
     t4 = (double)an.tv_sec + 2208988800.0 + an.tv_usec / 1e6;
-    abst[pos] = ((t2 - t1) + (t3 - t4)) / 2;
-    lauf[pos] = (t4 - t1) - (t3 - t2);
-    pos = (pos + 1) % 30;
-    if (n < 30) n++;
-    for (j = 0; j < n; j++) if (lauf[j] < beste) { beste = lauf[j]; ab = abst[j]; }
+    abst[Ntp_pos] = ((t2 - t1) + (t3 - t4)) / 2;
+    lauf[Ntp_pos] = (t4 - t1) - (t3 - t2);
+    Ntp_pos = (Ntp_pos + 1) % 30;
+    if (Ntp_n < 30) Ntp_n++;
+    for (j = 0; j < Ntp_n; j++) if (lauf[j] < beste) { beste = lauf[j]; ab = abst[j]; }
     if (!gemeldet) { Meld("AirPlay: Uhr des iPhones %+.6f s, Laufzeit %.1f ms", ab, beste * 1000); gemeldet = 1; }
+    S.uhr_ab = ab;
+    S.uhr_da = 1;
+    ton_uhr_schicken();
     f = fopen("/tmp/airplay_uhr", "w");
     if (f) { fprintf(f, "%.6f %.6f %llu\n", ab, beste, S.ts0_da ? S.ts0 : 0ULL); fclose(f); }
 }
@@ -365,6 +439,8 @@ static void ntp_start(struct in_addr wer, int port)
 {
     int ja = 1;
     if (S.ntp_fd >= 0) return;
+    Ntp_n = Ntp_pos = 0;     /* neue Sitzung: das iPhone kann inzwischen neu gestartet sein (Uhr ab Start) */
+    S.uhr_da = 0;
     S.ntp_fd = udp_offen(&S.ntp_port);
     if (S.ntp_fd < 0) return;
     setsockopt(S.ntp_fd, SOL_SOCKET, SO_TIMESTAMP, &ja, sizeof ja);
@@ -383,6 +459,9 @@ static void anzeige_aus(void)
     Stueck *s;
     if (S.anz_uhr) { CFRunLoopTimerInvalidate(S.anz_uhr); CFRelease(S.anz_uhr); S.anz_uhr = NULL; }
     if (S.anz_fd >= 0) { close(S.anz_fd); S.anz_fd = -1; }
+    if (S.ton_pipe >= 0) { close(S.ton_pipe); S.ton_pipe = -1; }
+    if (S.ton_pakete) Meld("AirPlay: Ton %ld Pakete, %ld nicht an die Anzeige", S.ton_pakete, S.ton_verloren);
+    S.ton_pakete = S.ton_verloren = 0;
     while ((s = S.kopf)) { S.kopf = s->nach; free(s); }
     S.ende = NULL;
     S.rueckstau = 0;
@@ -424,26 +503,33 @@ static void anzeige_leeren(void)
 
 static int anzeige_an(void)
 {
-    int p[2];
+    int p[2], q[2];
     pid_t pid;
     if (S.anz_fd >= 0) return 0;
     if (pipe(p)) return -1;
+    if (pipe(q)) { close(p[0]); close(p[1]); return -1; }
     pid = fork();
     if (pid == 0) {
         int fd;
         dup2(p[0], 0);
+        dup2(q[0], 3);      /* Ton */
         /* keine Netzverbindungen des Dienstes an die Anzeige vererben */
-        for (fd = 3; fd < 256; fd++) close(fd);
+        for (fd = 4; fd < 256; fd++) close(fd);
         /* Adresse des iPhones: fuer die Eingabe ueber den Entwickler-Tunnel per WLAN */
         execl(Anzeige_pfad, Anzeige_pfad, inet_ntoa(S.ntp_ziel.sin_addr), (char *)NULL);
         _exit(1);
     }
     close(p[0]);
-    if (pid < 0) { close(p[1]); return -1; }
+    close(q[0]);
+    if (pid < 0) { close(p[1]); close(q[1]); return -1; }
     S.anz_pid = pid;
     S.anz_fd = p[1];
     fcntl(S.anz_fd, F_SETFL, O_NONBLOCK);
+    S.ton_pipe = q[1];
+    fcntl(S.ton_pipe, F_SETFL, O_NONBLOCK);
+    fcntl(S.ton_pipe, F_SETFD, FD_CLOEXEC);
     S.bis_idr = 1;
+    ton_infos_schicken();
     return 0;
 }
 
@@ -815,6 +901,11 @@ static void setup(ApVerb *v, const Anfrage *a)
         playfair_decrypt(v->keymsg, k72, k16);
         if (v->geteilt_da) sha16(S.aeskey, k16, 16, v->geteilt, 32);
         else memcpy(S.aeskey, k16, 16);
+        {
+            int ni = 0;
+            const unsigned char *eiv = hole_daten(q, "eiv", &ni);
+            if (eiv && ni == 16) memcpy(S.aesiv, eiv, 16);
+        }
         S.aeskey_da = 1;
         if (hole_zahl(q, "timingPort", &tport) && tport > 0) ntp_start(v->ip, (int)tport);
         setz(d, "eventPort", zahl(0));
@@ -843,10 +934,22 @@ static void setup(ApVerb *v, const Anfrage *a)
                 setz(r, "type", zahl(110));
             } else if (typ == 96) {
                 int k;
+                long long ct = 0, spf = 0, sr = 0, af = 0;
+                hole_zahl(s, "ct", &ct);
+                hole_zahl(s, "spf", &spf);
+                hole_zahl(s, "sr", &sr);
+                hole_zahl(s, "audioFormat", &af);
+                snprintf(S.ton_format, sizeof S.ton_format, "ct=%lld spf=%lld sr=%lld af=%lld", ct, spf, sr, af);
+                Meld("AirPlay: Ton %s", S.ton_format);
                 for (k = 0; k < 2; k++) if (S.ton_fd[k] < 0) {
                     S.ton_fd[k] = udp_offen(&S.ton_port[k]);
-                    if (S.ton_fd[k] >= 0) S.ton_s[k] = quelle(S.ton_fd[k], ablassen, NULL);
+                    if (S.ton_fd[k] >= 0) S.ton_s[k] = quelle(S.ton_fd[k], k ? ton_steuer : ton_daten, NULL);
                 }
+                {
+                    int groesse = 256 * 1024;
+                    setsockopt(S.ton_fd[0], SOL_SOCKET, SO_RCVBUF, &groesse, sizeof groesse);
+                }
+                ton_infos_schicken();
                 setz(r, "dataPort", zahl(S.ton_port[0]));
                 setz(r, "controlPort", zahl(S.ton_port[1]));
                 setz(r, "type", zahl(96));
@@ -910,6 +1013,17 @@ static void bearbeiten(ApVerb *v, const Anfrage *a)
     else if (!strcmp(m, "OPTIONS"))
         antwort(v, a, 200, "OK", "Public: SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER\r\n", NULL, 0, NULL);
     else if (!strcmp(m, "TEARDOWN")) teardown(v, a);
+    else if (!strcmp(m, "SET_PARAMETER") && a->nrumpf > 7 && a->nrumpf < 64 && !strncmp((const char *)a->rumpf, "volume:", 7)) {
+        /* Lautstaerke des iPhones: -30..0 dB, -144 = stumm */
+        char t[64];
+        memcpy(t, a->rumpf, (size_t)a->nrumpf);
+        t[a->nrumpf] = 0;
+        S.ton_vol = atof(t + 7);
+        S.ton_vol_da = 1;
+        snprintf(t, sizeof t, "%.3f", S.ton_vol);
+        ton_text('v', t);
+        antwort(v, a, 200, "OK", NULL, NULL, 0, NULL);
+    }
     else if (!strcmp(m, "SET_PARAMETER") || !strcmp(m, "FLUSH") || !strcmp(m, "POST"))
         antwort(v, a, 200, "OK", NULL, NULL, 0, NULL);
     else antwort(v, a, 501, "Not Implemented", NULL, NULL, 0, NULL);

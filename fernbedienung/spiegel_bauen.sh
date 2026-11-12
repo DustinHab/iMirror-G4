@@ -31,9 +31,12 @@ if [ -f $FF/lib/libavcodec.a ] && [ "$1" = eigen ]; then
     FFL="$FF/lib/libavcodec.a $FF/lib/libavutil.a"
 fi
 gcc-4.2 $SDK -std=gnu99 -O2 -mcpu=7450 -Wall $DEK -c -o dekoder.o dekoder.c
+# Ton: Pakete vom Dienst (fd 3), AES, AAC-ELD ueber den Dekoder, CoreAudio
+gcc-4.2 $SDK -std=gnu99 -O2 -mcpu=7450 -Wall -c -o ton.o ton.c
 # erst daneben bauen, dann umbenennen: ein laufendes Fenster behaelt so seine alte Datei
 gcc-4.2 $SDK -O2 -mcpu=7450 -Wall -Ivlcinclude -L"$VLC/lib" -lpowervlc.5 -lpowervlccore.9 $APP/Contents/MacOS/VLC \
-    -framework Cocoa -framework Carbon -framework OpenGL -o $APP/Contents/MacOS/Spiegel.neu spiegel.m uyvy.o dekoder.o filter.o $FFL
+    -framework Cocoa -framework Carbon -framework OpenGL -framework AudioUnit -framework CoreAudio -lcrypto \
+    -o $APP/Contents/MacOS/Spiegel.neu spiegel.m uyvy.o dekoder.o filter.o ton.o $FFL
 strip $APP/Contents/MacOS/Spiegel.neu
 mv -f $APP/Contents/MacOS/Spiegel.neu $APP/Contents/MacOS/Spiegel
 for l in lib plugins share; do [ -e $APP/Contents/MacOS/$l ] || ln -s "$VLC/$l" $APP/Contents/MacOS/$l; done

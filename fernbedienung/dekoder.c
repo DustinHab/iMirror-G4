@@ -267,3 +267,93 @@ void dek_entlasten(int an) { F.opt_set(Ctx, "skip_loop_filter", an ? "nonref" : 
 
 /* nur fuer Messungen */
 void dek_filter(const char *wert) { F.opt_set(Ctx, "skip_loop_filter", wert, 0); }
+
+/* ---------- Ton: AAC (auch AAC-ELD) mit demselben FFmpeg ----------
+   Die AudioSpecificConfig kommt ueber AVCodecParameters in den Kontext: dessen Anfang (codec_type, codec_id,
+   codec_tag, extradata, extradata_size) ist seit FFmpeg 3.1 fest; vor dem Schreiben wird er an den Vorgaben von
+   avcodec_parameters_alloc geprueft. */
+static void *TCtx, *TPkt, *TFrame;
+
+int dek_ton_an(const unsigned char *asc, int n, int rate, int kanaele, char *fehler, int nf)
+{
+    void *(*par_alloc)(void);
+    int (*par_to_ctx)(void *, const void *);
+    void (*par_free)(void **);
+    const void *codec;
+    unsigned char *par, *ed;
+    if (!F.find_by_name) { snprintf(fehler, nf, "Dekoder nicht geladen"); return -1; }
+#ifdef EIGENES_FFMPEG
+    par_alloc = (void *(*)(void))avcodec_parameters_alloc;
+    par_to_ctx = (int (*)(void *, const void *))avcodec_parameters_to_context;
+    par_free = (void (*)(void **))avcodec_parameters_free;
+#else
+    par_alloc = (void *(*)(void))suchen(Mh, Slide, "_avcodec_parameters_alloc");
+    par_to_ctx = (int (*)(void *, const void *))suchen(Mh, Slide, "_avcodec_parameters_to_context");
+    par_free = (void (*)(void **))suchen(Mh, Slide, "_avcodec_parameters_free");
+#endif
+    if (!par_alloc || !par_to_ctx || !par_free) { snprintf(fehler, nf, "avcodec_parameters fehlt"); return -1; }
+    codec = F.find_by_name("aac");
+    if (!codec) { snprintf(fehler, nf, "kein AAC-Decoder"); return -1; }
+    TCtx = F.alloc_ctx(codec);
+    par = par_alloc();
+    if (!TCtx || !par) { snprintf(fehler, nf, "kein Kontext"); return -1; }
+    if (*(int *)par != -1 || *(int *)(par + 4) != 0 || *(void **)(par + 12) || *(int *)(par + 16)) {
+        snprintf(fehler, nf, "AVCodecParameters anders aufgebaut");
+        par_free((void **)&par);
+        return -1;
+    }
+    ed = F.malloc_((size_t)n + POLSTER);
+    if (!ed) { par_free((void **)&par); snprintf(fehler, nf, "kein Speicher"); return -1; }
+    memcpy(ed, asc, (size_t)n);
+    memset(ed + n, 0, POLSTER);
+    *(int *)par = 1;                    /* AVMEDIA_TYPE_AUDIO */
+    *(int *)(par + 4) = 0x15002;        /* AV_CODEC_ID_AAC */
+    *(unsigned char **)(par + 12) = ed;
+    *(int *)(par + 16) = n;
+    if (par_to_ctx(TCtx, par) < 0) { par_free((void **)&par); snprintf(fehler, nf, "parameters_to_context"); return -1; }
+    par_free((void **)&par);            /* gibt auch ed frei, der Kontext hat eine Kopie */
+    /* Abtastrate und Kanaele muss der Kontext selbst kennen, sonst gibt der Decoder Rahmen ohne beides aus
+       ("An invalid frame was output by a decoder", AVERROR_BUG) */
+    {
+        char t[16];
+        snprintf(t, sizeof t, "%d", rate);
+        F.opt_set(TCtx, "ar", t, 0);
+        F.opt_set(TCtx, "ch_layout", kanaele == 1 ? "mono" : "stereo", 0);
+    }
+    F.opt_set(TCtx, "threads", "1", 0);
+    if (F.open2(TCtx, codec, NULL) < 0) { snprintf(fehler, nf, "avcodec_open2 (AAC)"); return -1; }
+    TPkt = F.packet_alloc();
+    TFrame = F.frame_alloc();
+    if (!TPkt || !TFrame) { snprintf(fehler, nf, "kein Paket/Rahmen"); return -1; }
+    return 0;
+}
+
+int dek_ton_schicken(unsigned char *p, int n)
+{
+    int r;
+    if (F.from_data(TPkt, p, n) < 0) { F.free_(p); return -1; }
+    r = F.send(TCtx, TPkt);
+    F.packet_unref(TPkt);
+    return r == NOCHMAL ? 0 : r;
+}
+
+int dek_ton_holen(Dek_ton *t)
+{
+    int r = F.recv(TCtx, TFrame), *w;
+    float **daten;
+    if (r == NOCHMAL) return 0;
+    if (r < 0) return r;
+    daten = (float **)TFrame;
+    w = (int *)((char *)TFrame + 8 * sizeof(void *) + 8 * sizeof(int) + sizeof(void *));
+    t->links = daten[0];
+    t->rechts = daten[1] ? daten[1] : daten[0];
+    t->anzahl = w[2];
+    t->format = w[3];
+    if (t->anzahl <= 0 || t->anzahl > 8192 || !t->links || t->format != 8) {   /* 8 = AV_SAMPLE_FMT_FLTP */
+        F.frame_unref(TFrame);
+        return -1;
+    }
+    return 1;
+}
+
+void dek_ton_fertig(void) { F.frame_unref(TFrame); }

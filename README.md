@@ -16,9 +16,8 @@ Was geht:
 - Home, App-Umschalter und iPhone-Suche (⌘1, ⌘2, ⌘Leertaste)
 - gemeinsame Zwischenablage in beide Richtungen
 - Dateien und Fotos vom iPhone herausziehen, Dateien und Ordner aufs Fenster ziehen
+- Ton über die Lautsprecher des Macs, im Takt mit dem Bild; die Lautstärketasten des iPhones regeln ihn
 - per Kabel oder WLAN, beim Abziehen des Kabels geht die Steuerung nach etwa 4 s über WLAN weiter
-
-Kein Ton: Der Audiostrom wird angenommen, aber nicht abgespielt.
 
 ## Messwerte
 
@@ -73,16 +72,44 @@ hier kein direkter Vergleich.
 Die Zeitstempel, die das iPhone in den AirPlay-Strom schreibt, liegen etwa 85 ms nach der Ankunft am Mac. Sie sind
 also ein Wiedergabetermin, keine Aufnahmezeit. Das Fenster wartet darauf nicht, sondern zeigt jedes Bild sofort.
 
+### Ton
+
+Das iPhone schickt den Ton als AAC-ELD (44,1 kHz, Stereo, 480 Samples je Paket) und jedes Paket dreimal, versetzt
+mit den Nachbarn. Gemessen mit einem Video mit Ton, eine Minute:
+
+| | |
+|---|---|
+| Pakete | 92 je Sekunde (nach dem Aussortieren der Kopien) |
+| Dekodierfehler | 0 |
+| Ton gegen Bild | 38–52 ms später als das Bild, Ziel 40 ms |
+| Unterläufe (Knacken) | 0 in den 50 s nach dem Start |
+| Lücken | 0–2 je 5 s; diese Pakete kommen beim Mac nie an |
+| Ankunft vor dem Termin | 75–125 ms |
+| Entschlüsseln und Dekodieren | 0,09 ms je Paket, unter 1 % des Prozessors |
+
+Im WLAN selbst ging in einem Mitschnitt über 14,5 s kein Tonpaket verloren, keines kam in falscher Reihenfolge an.
+Die Ankunft schwankt im Median um 11 ms, bei 99 % der Pakete um höchstens 29 ms, im Einzelfall um 60 ms.
+
+Der Ton läuft absichtlich 40 ms hinter dem Bild. Ein nachlaufender Ton fällt erst ab etwa 100 ms auf, und die 40 ms
+sind Reserve gegen Verzögerungen im WLAN. Ohne diese Reserve gab es etwa drei Aussetzer je Minute. Hängt das Bild
+selbst für einen Moment, läuft der Ton weiter und ist kurz voraus.
+
+In den ersten 10 s nach dem Verbinden, bevor das erste Synchronpaket des iPhones da ist, gab es noch Aussetzer. Der
+Anfang hat seitdem einen größeren Puffer (120 statt 40 ms); das ist noch nicht nachgemessen.
+
 ### Last
 
-| Programm | Prozessor | Speicher |
-|---|---|---|
-| Fenster (Spiegel) | 19–20 % | 32 MB |
-| Dienst (fernbedienung) | etwa 1 % | 11 MB |
-| Steuerung (geraet) | etwa 3 % | 1 MB |
+| Programm | Prozessor beim Scrollen | Prozessor bei einem Video mit Ton | Speicher |
+|---|---|---|---|
+| Fenster (Spiegel) | 19–20 % | 47 % | 32 MB |
+| Dienst (fernbedienung) | etwa 1 % | 7 % | 11 MB |
+| Steuerung (geraet) | etwa 3 % | 3 % | 1 MB |
 
-Im WLAN: AirPlay rechnerisch etwa 1,3 Mbit/s bei 40 Bildern/s, dazu der Hilfsstrom der Entwicklerdienste, der auf
-1 Mbit/s begrenzt ist.
+Bei einem Video mit Ton bleibt gut die Hälfte des Prozessors frei. Ein bewegtes Video ist für den Decoder mehr
+Arbeit als eine Liste: 10–21 ms je Bild statt 4–12 ms.
+
+Im WLAN: AirPlay rechnerisch etwa 1,3 Mbit/s bei 40 Bildern/s, Ton etwa 0,25 Mbit/s (dreifach gesendet entsprechend
+mehr), dazu der Hilfsstrom der Entwicklerdienste, der auf 1 Mbit/s begrenzt ist.
 
 ## Aufbau
 
@@ -91,8 +118,9 @@ Drei Programme, alle in C oder Objective-C, gebaut mit gcc 4.2 aus Xcode 3.1:
 **fernbedienung** läuft als LaunchAgent in der Benutzersitzung. Es meldet den Mac im Netz als AirPlay-Empfänger an,
 mit einem eigenen kleinen Bonjour (mDNS) im Programm. Die Kopplung läuft über Legacy-Pairing (Ed25519, X25519),
 der FairPlay-Austausch über playfair aus UxPlay. Den H.264-Strom entschlüsselt es (AES-CTR) und reicht ihn mit
-Zeitstempel über eine Pipe an das Fenster weiter. Nebenbei ist es eine Apple-TV-Fernbedienung für den ganzen Mac
-(siehe unten).
+Zeitstempel über eine Pipe an das Fenster weiter. Die Tonpakete gehen über eine zweite Pipe ans Fenster, jedes nur
+einmal, dazu Schlüssel, Synchronpakete, Uhrabgleich und Lautstärke. Für den Uhrabgleich fragt es jede Sekunde die
+Uhr des iPhones ab (NTP). Nebenbei ist es eine Apple-TV-Fernbedienung für den ganzen Mac (siehe unten).
 
 **Spiegel.app** ist das Fenster. Zum Dekodieren dient das FFmpeg, das in PowerVLCs avcodec-Modul steckt. Das Modul
 wird per dlopen geladen, die FFmpeg-Funktionen sucht das Fenster in dessen Symboltabelle. Drei
@@ -100,6 +128,12 @@ H.264-Glättungsfilter tauscht es gegen eigene AltiVec-Fassungen. Jedes Bild wir
 Fenster hinterherhängt und schon der nächste Rahmen wartet, lässt es eines aus. Die Farbumrechnung nach UYVY
 läuft mit AltiVec, Skalierung, Farbraum und runde Ecken macht die Radeon (OpenGL, GL_YCBCR_422_APPLE, DMA aus dem
 Hauptspeicher).
+
+Den Ton entschlüsselt das Fenster (AES-128-CBC), bringt die Pakete in die richtige Reihenfolge und dekodiert sie
+mit demselben FFmpeg. Gespielt wird über CoreAudio. Das iPhone gibt Bild und Ton einen gemeinsamen
+Wiedergabetermin. Das Fenster zeigt Bilder früher als diesen Termin und misst laufend, um wie viel. Den Ton spielt
+es um denselben Betrag früher, abzüglich der 40 ms Reserve. Kleine Abweichungen gleicht es aus, indem es einzelne
+Samples auslässt oder doppelt, höchstens 6 von 512.
 
 **geraet** bringt die Eingaben aufs iPhone, denn AirPlay überträgt keine. Es baut wie Xcode einen
 CoreDevice-Tunnel zum iPhone auf: Lockdown-Kopplung, TLS, ein eigener IPv6/TCP-Stapel im Tunnel, darauf HTTP/2
@@ -249,6 +283,7 @@ verbunden (`Steuerung bereit` im Protokoll).
 | Kopieren am Mac | landet in der Zwischenablage des iPhones |
 | Kopieren am iPhone | landet in der Zwischenablage des Macs, Dateien als Vorschau in der Leiste zum Herausziehen |
 | Datei oder Ordner aufs Fenster ziehen | wird an der Stelle eingesetzt (Ordner als ZIP) |
+| Lautstärketasten am iPhone | Lautstärke des Tons auf dem Mac |
 
 Über dem Fenster erscheint bei Mauskontakt eine Leiste: Schließen, Home, App-Umschalter, Vorschau des zuletzt
 Kopierten. An der Leiste lässt sich das Fenster verschieben. Solange das Fenster vorn ist, ist ⌘Leertaste auf dem
@@ -313,7 +348,9 @@ stehen in `.gitignore` und gehören nicht in ein Repo.
 | `fernbedienung/kopplung.c`, `opack.c`, `rti.m` | Kopplung (SRP, HKDF, ChaCha20), OPACK, Tastatur-Archive |
 | `fernbedienung/eingabe.c`, `zeiger.m` | Tasten, Maus, Lautstärke, Bildschirm; runder Zeiger im Mausmodus |
 | `fernbedienung/spiegel.m` | Fenster: Bild, Eingabe, Zwischenablage, Messmodus |
-| `fernbedienung/dekoder.c`, `filter.c`, `uyvy.c` | H.264 über PowerVLCs FFmpeg, AltiVec-Filter, AltiVec-Farbumrechnung |
+| `fernbedienung/dekoder.c`, `filter.c`, `uyvy.c` | H.264 und AAC über PowerVLCs FFmpeg, AltiVec-Filter, AltiVec-Farbumrechnung |
+| `fernbedienung/ton.c` | Ton: Entschlüsseln, Reihenfolge, Dekodieren, CoreAudio, Gleichlauf mit dem Bild |
+| `fernbedienung/tontest.c` | Tonweg an einem Mitschnitt prüfen (`/tmp/ton_proben` anlegen, dann verbinden) |
 | `fernbedienung/iphone/geraet.c`, `tunnel.c`, `xpc.c` | Kopplung, Tunnel, RemoteXPC, Berührungen, Tasten, Zwischenablage, Entwickler-Abbild |
 | `fernbedienung/iphone/ddi_vorlage.py` | Vorlage für die Signaturanfrage aus dem BuildManifest |
 | `fernbedienung/playfair/` | FairPlay aus UxPlay, für Big Endian angepasst |
