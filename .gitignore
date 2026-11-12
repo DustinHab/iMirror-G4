@@ -1,0 +1,18 @@
+# Gebautes
+*.o
+*.dSYM/
+fernbedienung/fernbedienung
+fernbedienung/fernbedienung.neu
+fernbedienung/pruefen
+fernbedienung/rti_pruefen
+fernbedienung/Spiegel.app/
+fernbedienung/Zeiger.app/
+fernbedienung/vlcinclude/
+fernbedienung/iphone/geraet
+fernbedienung/iphone/geraet.neu
+trackpad/bau/
+
+# Gehoert nur auf das eigene Geraet
+fernbedienung/protokoll.txt
+fernbedienung/iphone/paarung.plist
+fernbedienung/iphone/ddi/
